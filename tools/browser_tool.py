@@ -64,6 +64,7 @@ import requests
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 from agent.auxiliary_client import call_llm
+from tools.managed_tool_gateway import resolve_managed_tool_gateway
 
 logger = logging.getLogger(__name__)
 
@@ -92,13 +93,13 @@ def _get_extraction_model() -> Optional[str]:
 
 
 def _is_local_mode() -> bool:
-    """Return True when no Browserbase credentials are configured.
+    """Return True when neither direct nor managed Browserbase is configured.
 
     In local mode the browser tools launch a headless Chromium instance via
     ``agent-browser --session`` instead of connecting to a remote Browserbase
     session via ``--cdp``.
     """
-    return not (os.environ.get("BROWSERBASE_API_KEY") and os.environ.get("BROWSERBASE_PROJECT_ID"))
+    return _get_browserbase_config_or_none() is None
 
 
 def _socket_safe_tmpdir() -> str:
@@ -183,10 +184,8 @@ def _emergency_cleanup_all_sessions():
                         logger.debug("Error closing local session %s: %s", session_name, e)
         else:
             # Cloud mode: release Browserbase sessions via API
-            api_key = os.environ.get("BROWSERBASE_API_KEY")
-            project_id = os.environ.get("BROWSERBASE_PROJECT_ID")
-
-            if not api_key or not project_id:
+            config = _get_browserbase_config_or_none()
+            if not config:
                 logger.warning("Cannot cleanup - missing BROWSERBASE credentials")
                 return
 
@@ -195,13 +194,13 @@ def _emergency_cleanup_all_sessions():
                 if bb_session_id:
                     try:
                         response = requests.post(
-                            f"https://api.browserbase.com/v1/sessions/{bb_session_id}",
+                            f"{config['base_url']}/v1/sessions/{bb_session_id}",
                             headers={
-                                "X-BB-API-Key": api_key,
+                                "X-BB-API-Key": config["api_key"],
                                 "Content-Type": "application/json"
                             },
                             json={
-                                "projectId": project_id,
+                                "projectId": config["project_id"],
                                 "status": "REQUEST_RELEASE"
                             },
                             timeout=5  # Short timeout for cleanup
@@ -567,7 +566,7 @@ def _create_browserbase_session(task_id: str) -> Dict[str, str]:
     
     # Create session via Browserbase API
     response = requests.post(
-        "https://api.browserbase.com/v1/sessions",
+        f"{config['base_url']}/v1/sessions",
         headers={
             "Content-Type": "application/json",
             "X-BB-API-Key": config["api_key"],
@@ -590,7 +589,7 @@ def _create_browserbase_session(task_id: str) -> Dict[str, str]:
                           "Sessions may timeout during long operations.")
             session_config.pop("keepAlive", None)
             response = requests.post(
-                "https://api.browserbase.com/v1/sessions",
+                f"{config['base_url']}/v1/sessions",
                 headers={
                     "Content-Type": "application/json",
                     "X-BB-API-Key": config["api_key"],
@@ -606,7 +605,7 @@ def _create_browserbase_session(task_id: str) -> Dict[str, str]:
                           "Bot detection may be less effective.")
             session_config.pop("proxies", None)
             response = requests.post(
-                "https://api.browserbase.com/v1/sessions",
+                f"{config['base_url']}/v1/sessions",
                 headers={
                     "Content-Type": "application/json",
                     "X-BB-API-Key": config["api_key"],
@@ -715,29 +714,49 @@ def _get_session_name(task_id: Optional[str] = None) -> str:
     return session_info["session_name"]
 
 
+def _get_browserbase_config_or_none() -> Optional[Dict[str, str]]:
+    """Return Browserbase config for direct or managed mode, or None for local mode."""
+    api_key = os.environ.get("BROWSERBASE_API_KEY")
+    project_id = os.environ.get("BROWSERBASE_PROJECT_ID")
+
+    if api_key and project_id:
+        return {
+            "api_key": api_key,
+            "project_id": project_id,
+            "base_url": os.environ.get("BROWSERBASE_BASE_URL", "https://api.browserbase.com").rstrip("/"),
+            "managed_mode": False,
+        }
+
+    managed = resolve_managed_tool_gateway("browserbase")
+    if managed is None:
+        return None
+
+    return {
+        "api_key": managed.nous_user_token,
+        "project_id": "managed",
+        "base_url": managed.gateway_origin.rstrip("/"),
+        "managed_mode": True,
+    }
+
+
 def _get_browserbase_config() -> Dict[str, str]:
     """
-    Get Browserbase configuration from environment.
+    Get Browserbase configuration from environment or managed gateway.
     
     Returns:
-        Dict with api_key and project_id
+        Dict with api_key, project_id, base_url, and managed_mode
         
     Raises:
         ValueError: If required env vars are not set
     """
-    api_key = os.environ.get("BROWSERBASE_API_KEY")
-    project_id = os.environ.get("BROWSERBASE_PROJECT_ID")
-    
-    if not api_key or not project_id:
+    config = _get_browserbase_config_or_none()
+    if not config:
         raise ValueError(
-            "BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID environment variables are required. "
-            "Get your credentials at https://browserbase.com"
+            "Browserbase requires either direct BROWSERBASE_API_KEY/BROWSERBASE_PROJECT_ID credentials "
+            "or a managed Browserbase gateway configuration."
         )
-    
-    return {
-        "api_key": api_key,
-        "project_id": project_id
-    }
+
+    return config
 
 
 def _find_agent_browser() -> str:
@@ -1615,7 +1634,7 @@ def _cleanup_old_recordings(max_age_hours=72):
 # Cleanup and Management Functions
 # ============================================================================
 
-def _close_browserbase_session(session_id: str, api_key: str, project_id: str) -> bool:
+def _close_browserbase_session(session_id: str, api_key: str, project_id: str, base_url: str) -> bool:
     """
     Close a Browserbase session immediately via the API.
     
@@ -1633,7 +1652,7 @@ def _close_browserbase_session(session_id: str, api_key: str, project_id: str) -
     try:
         # POST to update session status to REQUEST_RELEASE
         response = requests.post(
-            f"https://api.browserbase.com/v1/sessions/{session_id}",
+            f"{base_url.rstrip('/')}/v1/sessions/{session_id}",
             headers={
                 "X-BB-API-Key": api_key,
                 "Content-Type": "application/json"
@@ -1701,7 +1720,7 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
         if bb_session_id and not _is_local_mode():
             try:
                 config = _get_browserbase_config()
-                success = _close_browserbase_session(bb_session_id, config["api_key"], config["project_id"])
+                success = _close_browserbase_session(bb_session_id, config["api_key"], config["project_id"], config["base_url"])
                 if not success:
                     logger.warning("Could not close BrowserBase session %s", bb_session_id)
             except Exception as e:
@@ -1774,12 +1793,9 @@ def check_browser_requirements() -> bool:
     except FileNotFoundError:
         return False
 
-    # In cloud mode, also require Browserbase credentials
-    if not _is_local_mode():
-        api_key = os.environ.get("BROWSERBASE_API_KEY")
-        project_id = os.environ.get("BROWSERBASE_PROJECT_ID")
-        if not api_key or not project_id:
-            return False
+    # In remote mode, require either direct Browserbase credentials or the managed gateway
+    if not _is_local_mode() and _get_browserbase_config_or_none() is None:
+        return False
 
     return True
 

@@ -51,20 +51,26 @@ import asyncio
 from typing import List, Dict, Any, Optional, Tuple
 from firecrawl import Firecrawl
 from agent.auxiliary_client import get_async_text_auxiliary_client
-from hermes_cli.config import get_hermes_home
+from tools.managed_tool_gateway import (
+    build_vendor_gateway_url,
+    get_tool_gateway_scheme,
+    read_nous_access_token,
+    resolve_managed_tool_gateway,
+    is_managed_tool_gateway_ready,
+)
 from tools.debug_helpers import DebugSession
 
 logger = logging.getLogger(__name__)
 
 _firecrawl_client = None
 _firecrawl_client_config = None
-_DEFAULT_TOOL_GATEWAY_DOMAIN = "nousresearch.com"
-_DEFAULT_TOOL_GATEWAY_SCHEME = "https"
 
 
 def _auth_json_path():
     """Return the Hermes auth store path, respecting HERMES_HOME overrides."""
-    return get_hermes_home() / "auth.json"
+    from tools.managed_tool_gateway import auth_json_path
+
+    return auth_json_path()
 
 
 def _get_direct_firecrawl_config() -> Optional[tuple[Dict[str, str], tuple[str, Optional[str], Optional[str]]]]:
@@ -85,43 +91,27 @@ def _get_direct_firecrawl_config() -> Optional[tuple[Dict[str, str], tuple[str, 
 
 
 def _build_vendor_gateway_url(vendor: str) -> str:
-    """Return the gateway origin for a specific vendor.
-
-    Precedence:
-    1. `<VENDOR>_GATEWAY_URL` exact origin override
-    2. `TOOL_GATEWAY_DOMAIN` shared domain suffix plus `TOOL_GATEWAY_SCHEME`
-       shared scheme override, e.g. `rewbs.uk` + `http`
-       -> `http://firecrawl-gateway.rewbs.uk`
-    3. Default Nous production domain
-    """
-    vendor_key = f"{vendor.upper().replace('-', '_')}_GATEWAY_URL"
-    explicit_vendor_url = os.getenv(vendor_key, "").strip().rstrip("/")
-    if explicit_vendor_url:
-        return explicit_vendor_url
-
-    shared_scheme = _get_tool_gateway_scheme()
-    shared_domain = os.getenv("TOOL_GATEWAY_DOMAIN", "").strip().strip("/")
-    if shared_domain:
-        return f"{shared_scheme}://{vendor}-gateway.{shared_domain}"
-
-    return f"{shared_scheme}://{vendor}-gateway.{_DEFAULT_TOOL_GATEWAY_DOMAIN}"
+    """Return the gateway origin for a specific vendor."""
+    return build_vendor_gateway_url(vendor)
 
 
 def _get_tool_gateway_scheme() -> str:
     """Return configured shared gateway URL scheme."""
-    scheme = os.getenv("TOOL_GATEWAY_SCHEME", "").strip().lower()
-    if not scheme:
-        return _DEFAULT_TOOL_GATEWAY_SCHEME
-
-    if scheme in {"http", "https"}:
-        return scheme
-
-    raise ValueError("TOOL_GATEWAY_SCHEME must be 'http' or 'https'")
+    return get_tool_gateway_scheme()
 
 
 def _get_firecrawl_gateway_url() -> str:
     """Return configured Firecrawl gateway origin (without trailing slash)."""
     return _build_vendor_gateway_url("firecrawl")
+
+
+def _resolve_managed_tool_gateway(vendor: str):
+    """Return generic managed-tool gateway config for a vendor, if active."""
+    return resolve_managed_tool_gateway(
+        vendor,
+        gateway_builder=_build_vendor_gateway_url,
+        token_reader=_read_nous_access_token,
+    )
 
 
 def _get_firecrawl_client():
@@ -137,16 +127,15 @@ def _get_firecrawl_client():
     if direct_config is not None:
         kwargs, client_config = direct_config
     else:
-        gateway_url = _get_firecrawl_gateway_url()
-        gateway_token = _read_nous_access_token()
-        if not gateway_url or not gateway_token:
+        managed_gateway = _resolve_managed_tool_gateway("firecrawl")
+        if managed_gateway is None:
             _raise_web_backend_configuration_error()
 
         kwargs = {
-            "api_key": gateway_token,
-            "api_url": gateway_url,
+            "api_key": managed_gateway.nous_user_token,
+            "api_url": managed_gateway.gateway_origin,
         }
-        client_config = ("tool-gateway", kwargs["api_url"], gateway_token)
+        client_config = ("tool-gateway", kwargs["api_url"], managed_gateway.nous_user_token)
 
     if _firecrawl_client is not None and _firecrawl_client_config == client_config:
         return _firecrawl_client
@@ -160,32 +149,16 @@ def _get_firecrawl_client():
 
 def _read_nous_access_token() -> Optional[str]:
     """Read a Nous Subscriber OAuth access token from auth store or env override."""
-    explicit = os.getenv("TOOL_GATEWAY_USER_TOKEN")
-    if isinstance(explicit, str) and explicit.strip():
-        return explicit.strip()
-
-    try:
-        auth_path = _auth_json_path()
-        if not auth_path.is_file():
-            return None
-        data = json.loads(auth_path.read_text())
-        providers = data.get("providers", {})
-        if not isinstance(providers, dict):
-            return None
-        nous_provider = providers.get("nous", {})
-        if not isinstance(nous_provider, dict):
-            return None
-        access_token = nous_provider.get("access_token")
-        if isinstance(access_token, str) and access_token.strip():
-            return access_token.strip()
-    except Exception:
-        pass
-    return None
+    return read_nous_access_token()
 
 
 def _is_tool_gateway_ready() -> bool:
     """Return True when gateway URL and a Nous Subscriber token are available."""
-    return bool(_get_firecrawl_gateway_url()) and bool(_read_nous_access_token())
+    return is_managed_tool_gateway_ready(
+        "firecrawl",
+        gateway_builder=_build_vendor_gateway_url,
+        token_reader=_read_nous_access_token,
+    )
 
 
 def _has_direct_firecrawl_config() -> bool:

@@ -25,6 +25,9 @@ import logging
 import os
 from pathlib import Path
 from typing import Optional, Dict, Any
+from urllib.parse import urljoin
+
+from tools.managed_tool_gateway import resolve_managed_tool_gateway
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +59,13 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
           - "transcript" (str): The transcribed text (empty on failure)
           - "error" (str, optional): Error message if success is False
     """
-    api_key = os.getenv("VOICE_TOOLS_OPENAI_KEY")
-    if not api_key:
+    try:
+        api_key, base_url = _resolve_openai_audio_client_config()
+    except ValueError as exc:
         return {
             "success": False,
             "transcript": "",
-            "error": "VOICE_TOOLS_OPENAI_KEY not set",
+            "error": str(exc),
         }
 
     audio_path = Path(file_path)
@@ -113,17 +117,17 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
     try:
         from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
 
-        client = OpenAI(api_key=api_key, base_url="https://api.openai.com/v1")
+        client = OpenAI(api_key=api_key, base_url=base_url)
 
         with open(file_path, "rb") as audio_file:
+            response_format = "text" if model == "whisper-1" else "json"
             transcription = client.audio.transcriptions.create(
                 model=model,
                 file=audio_file,
-                response_format="text",
+                response_format=response_format,
             )
 
-        # The response is a plain string when response_format="text"
-        transcript_text = str(transcription).strip()
+        transcript_text = _extract_transcript_text(transcription)
 
         logger.info("Transcribed %s (%d chars)", audio_path.name, len(transcript_text))
 
@@ -167,3 +171,38 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             "transcript": "",
             "error": f"Transcription failed: {e}",
         }
+
+
+def _resolve_openai_audio_client_config() -> tuple[str, str]:
+    """Return direct OpenAI audio credentials or managed gateway fallback."""
+    direct_api_key = os.getenv("VOICE_TOOLS_OPENAI_KEY", "").strip()
+    if direct_api_key:
+        return direct_api_key, "https://api.openai.com/v1"
+
+    managed_gateway = resolve_managed_tool_gateway("openai-audio")
+    if managed_gateway is None:
+        raise ValueError(
+            "VOICE_TOOLS_OPENAI_KEY not set and managed OpenAI audio gateway is unavailable"
+        )
+
+    return managed_gateway.nous_user_token, urljoin(
+        f"{managed_gateway.gateway_origin.rstrip('/')}/", "v1"
+    )
+
+
+def _extract_transcript_text(transcription: Any) -> str:
+    """Normalize text and JSON transcription response shapes to a plain string."""
+    if isinstance(transcription, str):
+        return transcription.strip()
+
+    if hasattr(transcription, "text"):
+        value = getattr(transcription, "text")
+        if isinstance(value, str):
+            return value.strip()
+
+    if isinstance(transcription, dict):
+        value = transcription.get("text")
+        if isinstance(value, str):
+            return value.strip()
+
+    return str(transcription).strip()
