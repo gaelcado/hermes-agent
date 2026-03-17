@@ -403,6 +403,20 @@ def load_gateway_config() -> GatewayConfig:
                     True,
                 )
 
+            # Bridge gateway streaming config from the user-facing config source.
+            # This is the documented location for Telegram/Discord/Slack
+            # progressive message editing, so it should override gateway.json.
+            streaming_cfg = yaml_cfg.get("streaming")
+            if streaming_cfg is not None:
+                if isinstance(streaming_cfg, dict):
+                    config.streaming = StreamingConfig.from_dict(streaming_cfg)
+                else:
+                    logger.warning(
+                        "Ignoring invalid streaming config in config.yaml "
+                        "(expected mapping, got %s)",
+                        type(streaming_cfg).__name__,
+                    )
+
             # Bridge discord settings from config.yaml to env vars
             # (env vars take precedence — only set if not already defined)
             discord_cfg = yaml_cfg.get("discord", {})

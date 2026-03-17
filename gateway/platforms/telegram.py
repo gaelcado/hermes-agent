@@ -414,13 +414,22 @@ class TelegramAdapter(BasePlatformAdapter):
                     text=formatted,
                     parse_mode=ParseMode.MARKDOWN_V2,
                 )
-            except Exception:
+            except Exception as md_err:
+                err_text = str(md_err).lower()
+                if "message is not modified" in err_text:
+                    return SendResult(success=True, message_id=message_id)
                 # Fallback: retry without markdown formatting
-                await self._bot.edit_message_text(
-                    chat_id=int(chat_id),
-                    message_id=int(message_id),
-                    text=content,
-                )
+                try:
+                    await self._bot.edit_message_text(
+                        chat_id=int(chat_id),
+                        message_id=int(message_id),
+                        text=content,
+                    )
+                except Exception as plain_err:
+                    plain_err_text = str(plain_err).lower()
+                    if "message is not modified" in plain_err_text:
+                        return SendResult(success=True, message_id=message_id)
+                    raise
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             logger.error(
