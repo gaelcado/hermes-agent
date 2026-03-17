@@ -106,6 +106,10 @@ class TelegramAdapter(BasePlatformAdapter):
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
     MEDIA_GROUP_WAIT_SECONDS = 0.8
+    # Telegram progressive edits are rate-limited more aggressively than the
+    # generic gateway default. Keep a platform-specific floor and still honor
+    # explicit RetryAfter values from the Bot API when they occur.
+    STREAM_EDIT_INTERVAL_FLOOR = 0.4
     
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.TELEGRAM)
@@ -125,6 +129,20 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._token_lock_identity: Optional[str] = None
         self._polling_error_task: Optional[asyncio.Task] = None
+
+    @staticmethod
+    def _is_message_not_modified(error: Exception) -> bool:
+        return "message is not modified" in str(error).lower()
+
+    @staticmethod
+    def _retry_after_seconds(error: Exception) -> Optional[float]:
+        retry_after = getattr(error, "retry_after", None)
+        if retry_after is None:
+            return None
+        try:
+            return max(float(retry_after), 0.0)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _looks_like_polling_conflict(error: Exception) -> bool:
@@ -344,9 +362,10 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id = metadata.get("thread_id") if metadata else None
             
             try:
-                from telegram.error import NetworkError as _NetErr
+                from telegram.error import NetworkError as _NetErr, RetryAfter as _RetryAfter
             except ImportError:
                 _NetErr = OSError  # type: ignore[misc,assignment]
+                _RetryAfter = TimeoutError  # type: ignore[misc,assignment]
 
             for i, chunk in enumerate(chunks):
                 msg = None
@@ -376,6 +395,22 @@ class TelegramAdapter(BasePlatformAdapter):
                             else:
                                 raise
                         break  # success
+                    except _RetryAfter as send_err:
+                        if _send_attempt < 2:
+                            wait = self._retry_after_seconds(send_err)
+                            if wait is None:
+                                wait = 2 ** _send_attempt
+                            wait = max(wait, self.STREAM_EDIT_INTERVAL_FLOOR)
+                            logger.warning(
+                                "[%s] Telegram flood control on send (attempt %d/3), retrying in %.2fs: %s",
+                                self.name,
+                                _send_attempt + 1,
+                                wait,
+                                send_err,
+                            )
+                            await asyncio.sleep(wait)
+                        else:
+                            raise
                     except _NetErr as send_err:
                         if _send_attempt < 2:
                             wait = 2 ** _send_attempt
@@ -406,31 +441,70 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
         try:
-            formatted = self.format_message(content)
             try:
-                await self._bot.edit_message_text(
-                    chat_id=int(chat_id),
-                    message_id=int(message_id),
-                    text=formatted,
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                )
-            except Exception as md_err:
-                err_text = str(md_err).lower()
-                if "message is not modified" in err_text:
-                    return SendResult(success=True, message_id=message_id)
-                # Fallback: retry without markdown formatting
+                from telegram.error import NetworkError as _NetErr, RetryAfter as _RetryAfter
+            except ImportError:
+                _NetErr = OSError  # type: ignore[misc,assignment]
+                _RetryAfter = TimeoutError  # type: ignore[misc,assignment]
+
+            formatted = self.format_message(content)
+            for _edit_attempt in range(3):
                 try:
-                    await self._bot.edit_message_text(
-                        chat_id=int(chat_id),
-                        message_id=int(message_id),
-                        text=content,
-                    )
-                except Exception as plain_err:
-                    plain_err_text = str(plain_err).lower()
-                    if "message is not modified" in plain_err_text:
-                        return SendResult(success=True, message_id=message_id)
+                    try:
+                        await self._bot.edit_message_text(
+                            chat_id=int(chat_id),
+                            message_id=int(message_id),
+                            text=formatted,
+                            parse_mode=ParseMode.MARKDOWN_V2,
+                        )
+                    except Exception as md_err:
+                        if self._retry_after_seconds(md_err) is not None:
+                            raise
+                        if self._is_message_not_modified(md_err):
+                            return SendResult(success=True, message_id=message_id)
+                        # Fallback: retry without markdown formatting
+                        try:
+                            await self._bot.edit_message_text(
+                                chat_id=int(chat_id),
+                                message_id=int(message_id),
+                                text=content,
+                            )
+                        except Exception as plain_err:
+                            if self._retry_after_seconds(plain_err) is not None:
+                                raise
+                            if self._is_message_not_modified(plain_err):
+                                return SendResult(success=True, message_id=message_id)
+                            raise
+                    return SendResult(success=True, message_id=message_id)
+                except _RetryAfter as edit_err:
+                    if _edit_attempt < 2:
+                        wait = self._retry_after_seconds(edit_err)
+                        if wait is None:
+                            wait = 2 ** _edit_attempt
+                        wait = max(wait, self.STREAM_EDIT_INTERVAL_FLOOR)
+                        logger.warning(
+                            "[%s] Telegram flood control on edit (attempt %d/3), retrying in %.2fs: %s",
+                            self.name,
+                            _edit_attempt + 1,
+                            wait,
+                            edit_err,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
                     raise
-            return SendResult(success=True, message_id=message_id)
+                except _NetErr as edit_err:
+                    if _edit_attempt < 2:
+                        wait = 2 ** _edit_attempt
+                        logger.warning(
+                            "[%s] Network error on edit (attempt %d/3), retrying in %ds: %s",
+                            self.name,
+                            _edit_attempt + 1,
+                            wait,
+                            edit_err,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    raise
         except Exception as e:
             logger.error(
                 "[%s] Failed to edit Telegram message %s: %s",

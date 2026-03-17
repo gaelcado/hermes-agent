@@ -61,6 +61,9 @@ class GatewayStreamConsumer:
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
+        interval_floor = getattr(adapter, "STREAM_EDIT_INTERVAL_FLOOR", 0.0)
+        if interval_floor:
+            self.cfg.edit_interval = max(self.cfg.edit_interval, float(interval_floor))
         self.metadata = metadata
         self._queue: queue.Queue = queue.Queue()
         self._accumulated = ""

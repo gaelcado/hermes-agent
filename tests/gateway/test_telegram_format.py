@@ -28,8 +28,22 @@ def _ensure_telegram_mock():
     mod.constants.ChatType.SUPERGROUP = "supergroup"
     mod.constants.ChatType.CHANNEL = "channel"
     mod.constants.ChatType.PRIVATE = "private"
-    for name in ("telegram", "telegram.ext", "telegram.constants"):
+
+    class _MockNetworkError(Exception):
+        pass
+
+    class _MockRetryAfter(Exception):
+        def __init__(self, retry_after):
+            self.retry_after = retry_after
+            super().__init__(f"Flood control exceeded. Retry in {retry_after} seconds")
+
+    error_mod = MagicMock()
+    error_mod.NetworkError = _MockNetworkError
+    error_mod.RetryAfter = _MockRetryAfter
+
+    for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.error"):
         sys.modules.setdefault(name, mod)
+    sys.modules["telegram.error"] = error_mod
 
 
 _ensure_telegram_mock()
@@ -416,3 +430,49 @@ async def test_send_escapes_chunk_indicator_for_markdownv2(adapter):
     assert len(sent_texts) > 1
     assert re.search(r" \\\([0-9]+/[0-9]+\\\)$", sent_texts[0])
     assert re.search(r" \\\([0-9]+/[0-9]+\\\)$", sent_texts[-1])
+
+
+@pytest.mark.asyncio
+async def test_send_retries_retry_after_then_succeeds(adapter, monkeypatch):
+    from telegram.error import RetryAfter
+
+    adapter._bot = MagicMock()
+    msg = MagicMock()
+    msg.message_id = 42
+    adapter._bot.send_message = AsyncMock(side_effect=[RetryAfter(0.2), msg])
+
+    sleep_calls = []
+
+    async def _fake_sleep(delay):
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr("gateway.platforms.telegram.asyncio.sleep", _fake_sleep)
+
+    result = await adapter.send("123", "hello")
+
+    assert result.success is True
+    assert result.message_id == "42"
+    assert adapter._bot.send_message.await_count == 2
+    assert sleep_calls == [adapter.STREAM_EDIT_INTERVAL_FLOOR]
+
+
+@pytest.mark.asyncio
+async def test_edit_message_retries_retry_after_then_succeeds(adapter, monkeypatch):
+    from telegram.error import RetryAfter
+
+    adapter._bot = MagicMock()
+    adapter._bot.edit_message_text = AsyncMock(side_effect=[RetryAfter(0.2), MagicMock()])
+
+    sleep_calls = []
+
+    async def _fake_sleep(delay):
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr("gateway.platforms.telegram.asyncio.sleep", _fake_sleep)
+
+    result = await adapter.edit_message("123", "77", "hello")
+
+    assert result.success is True
+    assert result.message_id == "77"
+    assert adapter._bot.edit_message_text.await_count == 2
+    assert sleep_calls == [adapter.STREAM_EDIT_INTERVAL_FLOOR]
