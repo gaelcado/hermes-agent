@@ -6012,7 +6012,7 @@ class GatewayRunner:
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
             pending = None
-            if result and adapter and session_key:
+            if result and adapter and session_key and hasattr(adapter, "get_pending_message"):
                 if result.get("interrupted"):
                     # Interrupted — consume the interrupt message
                     pending_event = adapter.get_pending_message(session_key)
